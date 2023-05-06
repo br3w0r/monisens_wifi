@@ -4,27 +4,23 @@ mod c_parser;
 use bindings_gen as bg;
 
 use std::collections::HashSet;
-use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 use std::{
     ffi::{CStr, CString},
-    io::{Read, Write},
-    net::TcpStream,
     ptr::null,
-    time::Duration,
 };
 
 use async_macros::select;
 use async_std::{
     channel::{self, Receiver, Sender},
+    io::{ReadExt, WriteExt},
+    net::TcpStream,
     task,
 };
 use lazy_static::lazy_static;
 use libc::c_void;
-
-const THREAD_SLEEP_DURATION: Duration = Duration::from_millis(100);
 
 const CONN_PARAM_IP: &str = "IP Address with port";
 
@@ -36,9 +32,6 @@ const SENSOR_DATA_LIGHT: &str = "light";
 const SENSOR_DATA_TEMP: &str = "temperature";
 const SENSOR_DATA_HUMIDITY: &str = "humidity";
 const SENSOR_DATA_TIMESTAMP: &str = "timestamp";
-
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
-const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
 lazy_static! {
     static ref AVAILABLE_MSG_TYPES: HashSet<u8> = HashSet::from([b':', b'>']);
@@ -115,7 +108,7 @@ pub unsafe extern "C" fn init(sel: *mut *mut c_void) {
 
 #[no_mangle]
 pub unsafe extern "C" fn obtain_device_info(
-    handler: *mut c_void,
+    _: *mut c_void,
     obj: *mut c_void,
     callback: bg::device_info_callback,
 ) {
@@ -164,7 +157,8 @@ fn connect_device_impl(
     let module = unsafe { Handle(handler).as_module() };
     let conf = ConnConf::new(confs)?;
 
-    let client = TcpStream::connect(&conf.ip).map_err(|_| DeviceErr::DeviceErrConn)?;
+    let client = task::block_on(async { TcpStream::connect(&conf.ip).await })
+        .map_err(|_| DeviceErr::DeviceErrConn)?;
 
     module.client = Some(Arc::new(Mutex::new(client)));
     module.conn_conf = Some(conf);
@@ -275,8 +269,7 @@ fn configure_device_impl(handler: *mut c_void, conf: *mut bg::DeviceConf) -> Res
         .unwrap();
 
     let msg = format!("d{};", device_conf.comm_interval);
-    client
-        .write(msg.as_bytes())
+    task::block_on(async { client.write(msg.as_bytes()).await })
         .map_err(|_| DeviceErr::DeviceErrConn)?;
 
     module.device_conf = Some(device_conf);
@@ -372,8 +365,6 @@ fn start_impl(
         .ok_or(DeviceErr::DeviceErrConn)?
         .clone();
 
-    let comm_interval = module.device_conf.as_ref().unwrap().comm_interval.clone();
-
     let t = thread::spawn(move || {
         let msg_processor = MsgProcessor {
             handle_func,
@@ -383,42 +374,22 @@ fn start_impl(
         let stop_rx = rx;
         let mut client = client.lock().unwrap();
 
-        {
-            client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-            // clear buffer before start
-            let mut buf = [0u8; 32];
-            loop {
-                let res = client.read(&mut buf);
-                if let Err(ref err) = res {
-                    if err.kind() == ErrorKind::WouldBlock {
-                        break;
-                    } else {
-                        res.unwrap();
-                    }
-                }
-            }
-        }
-
-        client.set_read_timeout(None).unwrap();
-
-        client.write(b"a;").unwrap();
+        task::block_on(async { client.write(b"a;").await }).unwrap();
 
         let mut buf: Vec<u8> = Vec::with_capacity(64);
         loop {
             let mut c = [0u8];
-            if client.read(&mut c).unwrap() > 0 {
-                match c[0] {
-                    b'\n' => {
-                        msg_processor.process(buf.drain(..).collect());
+            if !task::block_on(read_with_cancel(&mut client, &mut c, &stop_rx)) {
+                // Stopping thread
+                task::block_on(async { client.write(b"i;").await }).unwrap();
+                return;
+            }
 
-                        if !task::block_on(timer_with_cancel(THREAD_SLEEP_DURATION, &stop_rx)) {
-                            // Stopping thread
-                            client.write(b"i;").unwrap();
-                            return;
-                        }
-                    }
-                    val => buf.push(val),
+            match c[0] {
+                b'\n' => {
+                    msg_processor.process(buf.drain(..).collect());
                 }
+                val => buf.push(val),
             }
         }
     });
@@ -458,7 +429,7 @@ struct MsgProcessor {
 impl MsgProcessor {
     fn process(&self, msg: Vec<u8>) {
         let sanitized_msg = Self::sanitize_serial_msg(msg);
-        if let None = sanitized_msg {
+        if sanitized_msg.is_none() {
             return;
         }
         let sanitized_msg = sanitized_msg.unwrap();
@@ -472,7 +443,7 @@ impl MsgProcessor {
                 let sensor_data = Self::format_data_msg(&msg).unwrap();
                 self.send_sensor_data(sensor_data);
             }
-            _ => panic!("unexpected message from device: {}", msg),
+            _ => panic!("unexpected message from device: {msg}"),
         };
     }
 
@@ -569,9 +540,9 @@ impl MsgProcessor {
 }
 
 /// Returns `true` if timeout has passed and no message was received from `stop_rx`
-async fn timer_with_cancel(dur: Duration, stop_rx: &Receiver<()>) -> bool {
-    let sleep_fut = async {
-        task::sleep(dur).await;
+async fn read_with_cancel(reader: &mut TcpStream, buf: &mut [u8], stop_rx: &Receiver<()>) -> bool {
+    let read_fut = async {
+        reader.read(buf).await.unwrap();
 
         true
     };
@@ -581,5 +552,5 @@ async fn timer_with_cancel(dur: Duration, stop_rx: &Receiver<()>) -> bool {
         false
     };
 
-    select!(stop_fut, sleep_fut).await
+    select!(stop_fut, read_fut).await
 }
