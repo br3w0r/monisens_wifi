@@ -2,8 +2,13 @@ mod bindings_gen;
 mod c_parser;
 
 use bindings_gen as bg;
+use c_parser::str_from_c_char;
 
+use libc::c_void;
 use std::collections::HashSet;
+use std::ffi::c_char;
+use std::fs::File;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
@@ -20,7 +25,10 @@ use async_std::{
     task,
 };
 use lazy_static::lazy_static;
-use libc::c_void;
+use serde::{Deserialize, Serialize};
+
+const CONN_CONF_FILE_NAME: &str = "conn_conf.bin";
+const DEVICE_CONF_FILE_NAME: &str = "device_conf.bin";
 
 const CONN_PARAM_IP: &str = "IP Address with port";
 
@@ -43,6 +51,7 @@ pub extern "C" fn mod_version() -> u8 {
 }
 
 pub struct Module {
+    data_dir: String,
     client: Option<Arc<Mutex<TcpStream>>>,
 
     conn_conf: Option<ConnConf>,
@@ -51,6 +60,12 @@ pub struct Module {
     // Process flow
     thread_handle: Option<JoinHandle<()>>,
     stop_tx: Option<Sender<()>>,
+}
+
+impl Module {
+    pub fn is_ready_for_start(&self) -> bool {
+        !self.client.is_none() && !self.conn_conf.is_none() && !self.device_conf.is_none()
+    }
 }
 
 #[repr(transparent)]
@@ -94,13 +109,45 @@ pub unsafe extern "C" fn functions() -> bg::Functions {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn init(sel: *mut *mut c_void) {
-    let m = Module {
-        client: None,
-        conn_conf: None,
-        device_conf: None,
-        thread_handle: None,
-        stop_tx: None,
+pub unsafe extern "C" fn init(sel: *mut *mut c_void, data_dir: *mut c_char) {
+    let data_dir = str_from_c_char(data_dir);
+
+    let m = if let Ok(conn_conf_file) = File::open(&(data_dir.clone() + CONN_CONF_FILE_NAME)) {
+        // Reinitialize already initialized module
+        let device_conf_file = File::open(&(data_dir.clone() + DEVICE_CONF_FILE_NAME))
+            .expect("couldn't find device conf file. Was module fully initialized?");
+
+        let conn_conf: ConnConf = bincode::deserialize_from(&conn_conf_file).expect(&format!(
+            "failed to deserialize conn config file: '{data_dir}'"
+        ));
+
+        let device_conf: DeviceConf = bincode::deserialize_from(&device_conf_file).expect(
+            &format!("failed to deserialize device config file: '{data_dir}'"),
+        );
+
+        let mut client = connect_client(&conn_conf.ip).expect("failed to connect to client");
+
+        send_delay_conf(&mut client, device_conf.comm_interval)
+            .expect("failed to set delay conf for device");
+
+        Module {
+            data_dir,
+            client: Some(Arc::new(Mutex::new(client))),
+            conn_conf: Some(conn_conf),
+            device_conf: Some(device_conf),
+            thread_handle: None,
+            stop_tx: None,
+        }
+    } else {
+        // Initialize new module
+        Module {
+            data_dir,
+            client: None,
+            conn_conf: None,
+            device_conf: None,
+            thread_handle: None,
+            stop_tx: None,
+        }
     };
 
     *sel = Handle::from_module(m).0;
@@ -135,6 +182,7 @@ pub unsafe extern "C" fn destroy(sel: *mut c_void) {
 
 const DEVICE_ERROR_NONE: u8 = 0;
 
+#[derive(Debug)]
 #[repr(u8)]
 pub enum DeviceErr {
     DeviceErrConn = 1,
@@ -157,8 +205,14 @@ fn connect_device_impl(
     let module = unsafe { Handle(handler).as_module() };
     let conf = ConnConf::new(confs)?;
 
-    let client = task::block_on(async { TcpStream::connect(&conf.ip).await })
-        .map_err(|_| DeviceErr::DeviceErrConn)?;
+    let client = connect_client(&conf.ip)?;
+
+    // Save new conf to file
+    let conf_ser = bincode::serialize(&conf).expect("failed to serialize new conn conf");
+    let mut file = File::create(&(module.data_dir.clone() + CONN_CONF_FILE_NAME))
+        .expect("failed to create or open conf file for saving new conn conf");
+    file.write_all(&conf_ser)
+        .expect("failed to write new conn conf into file");
 
     module.client = Some(Arc::new(Mutex::new(client)));
     module.conn_conf = Some(conf);
@@ -200,7 +254,7 @@ extern "C" fn obtain_device_conf_info(
     unsafe { callback.unwrap()(obj, &mut conf_info as _) };
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ConnConf {
     ip: String,
 }
@@ -230,9 +284,9 @@ impl ConnConf {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct DeviceConf {
-    comm_interval: i32,
+    comm_interval: i16,
 }
 
 impl DeviceConf {
@@ -244,7 +298,7 @@ impl DeviceConf {
         }
 
         Ok(DeviceConf {
-            comm_interval: unsafe { *(raw_conf[0].data as *const i32) },
+            comm_interval: unsafe { *(raw_conf[0].data as *const i16) },
         })
     }
 }
@@ -268,9 +322,14 @@ fn configure_device_impl(handler: *mut c_void, conf: *mut bg::DeviceConf) -> Res
         .lock()
         .unwrap();
 
-    let msg = format!("d{};", device_conf.comm_interval);
-    task::block_on(async { client.write(msg.as_bytes()).await })
-        .map_err(|_| DeviceErr::DeviceErrConn)?;
+    send_delay_conf(&mut client, device_conf.comm_interval)?;
+
+    // Save new conf to file
+    let conf_ser = bincode::serialize(&device_conf).expect("failed to serialize new device conf");
+    let mut file = File::create(&(module.data_dir.clone() + DEVICE_CONF_FILE_NAME))
+        .expect("failed to create or open conf file for saving new device conf");
+    file.write_all(&conf_ser)
+        .expect("failed to write new device conf into file");
 
     module.device_conf = Some(device_conf);
 
@@ -355,6 +414,10 @@ fn start_impl(
     handle_func: bg::handle_msg_func,
 ) -> Result<(), DeviceErr> {
     let module = unsafe { Handle(handler).as_module() };
+
+    if !module.is_ready_for_start() {
+        panic!("start function when the module is not ready to for start");
+    }
 
     let handle = MsgHandle(msg_handler);
     let (tx, rx) = channel::bounded(1);
@@ -553,4 +616,16 @@ async fn read_with_cancel(reader: &mut TcpStream, buf: &mut [u8], stop_rx: &Rece
     };
 
     select!(stop_fut, read_fut).await
+}
+
+fn send_delay_conf(client: &mut TcpStream, delay: i16) -> Result<(), DeviceErr> {
+    let msg = format!("d{};", delay);
+    task::block_on(async { client.write(msg.as_bytes()).await })
+        .map_err(|_| DeviceErr::DeviceErrConn)?;
+
+    Ok(())
+}
+
+fn connect_client(ip: &str) -> Result<TcpStream, DeviceErr> {
+    task::block_on(async { TcpStream::connect(ip).await }).map_err(|_| DeviceErr::DeviceErrConn)
 }

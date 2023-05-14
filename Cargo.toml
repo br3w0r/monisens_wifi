@@ -10,6 +10,8 @@ libc = "0.2.132"
 async-std = "1"
 async-macros = "1"
 lazy_static = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 
 [lib]
 crate-type = ["cdylib"]
