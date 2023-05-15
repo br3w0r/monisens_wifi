@@ -416,7 +416,7 @@ fn start_impl(
     let module = unsafe { Handle(handler).as_module() };
 
     if !module.is_ready_for_start() {
-        panic!("start function when the module is not ready to for start");
+        panic!("start function when the module is not ready to start");
     }
 
     let handle = MsgHandle(msg_handler);
